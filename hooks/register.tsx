@@ -83,11 +83,11 @@ async function inlineImg($: any, key: string, input: { path?: string; base64?: s
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
   const { Box, Image } = $.ui.resolve(e)
-  const total = Math.max(10, Math.min(80, (e.viewport?.columns ?? 80) - 6))
-  // side by side when each picture still gets 20+ columns; else stacked with a blank line between
-  const per = Math.floor((total - (imgs.length - 1)) / imgs.length)
-  const side = per >= 20
-  const columns = side ? per : total
+  const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6)
+  // side by side only when each picture still gets 40+ columns (80 max each); else stacked with a blank line between
+  const per = Math.min(80, Math.floor((avail - (imgs.length - 1)) / imgs.length))
+  const side = imgs.length > 1 && per >= 40
+  const columns = side ? per : Math.min(80, avail)
 
   return (
     <Box flexDirection="column">
