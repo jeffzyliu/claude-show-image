@@ -1,0 +1,267 @@
+// show-image: draw PNGs in the Claude Code window.
+//
+// How a picture reaches the screen: this mod never writes terminal escape codes. It gives the engine an
+// `Image` element, and the engine paints it with whatever the terminal supports:
+//   - Ghostty, kitty: the kitty graphics protocol, inline, no setup.
+//   - iTerm2 3.5+: iTerm2's inline images, but only under Claude Code's fullscreen rendering.
+//   - tmux: only with `allow-passthrough` and `focus-events` on, inside one of the terminals above.
+//   - anything else (Terminal.app, VS Code's terminal, ...): the element draws its `alt` text instead.
+//     The pane then has an "open e" button that hands the file to the system viewer (open / xdg-open).
+// The mod cannot ask which terminal it is in, so every picture is always sent and the engine decides.
+//
+// Where pictures show up:
+//   - Inline under any tool row whose result holds PNG image blocks (e.g. dofile graphs), folded or not.
+//   - Inline under the `/img` output row and the `show_image` tool row.
+//   - In a pane with zoom and pan (/img --pane, or the `openPane` option).
+// PNG only, under 2 MiB, up to 3 per row: that is what `Image` accepts.
+
+import { atom, read, update } from 'claude-code'
+import type { Register } from 'claude-code'
+
+import type { Img, View } from '../types'
+
+const PANE = 'show-image'
+const MAX_BYTES = 2 * 1024 * 1024 // the most `Image` takes as bytes held by the plugin, on every terminal
+const view = atom({ plugin: 'show-image', key: 'view' } as const, { zoom: 1, panX: 0, panY: 0 } as View, {
+  shape: 'view-2',
+})
+// Fallback for terminals that can't draw inline images (see the header): hand the file to the system viewer.
+async function openExternally($: any, path: string) {
+  for (const cmd of ['open', 'xdg-open']) {
+    try {
+      const r = await $.process.run([cmd, path])
+      if (r.exitCode === 0) return
+    } catch {} // shortcut: no Windows 'start'; add it when someone asks
+  }
+  $.ui.toast(`Could not open ${path}`)
+}
+
+const image = atom({ plugin: 'show-image', key: 'image' } as const, null, {
+  shape: 'image-2',
+})
+
+// Reads the PNG's size from its header. shortcut: PNG only (`Image` takes PNG or raw RGBA on every terminal); JPEG/GIF would need a decoder, convert first.
+function parsePng(base64: string, label: string): Img {
+  const b64 = base64.replace(/^data:image\/png;base64,/, '').replace(/\s+/g, '')
+  const head = Uint8Array.fromBase64(b64.slice(0, 64)) // 48 bytes: signature + IHDR
+  const sig = [0x89, 0x50, 0x4e, 0x47]
+  if (head.length < 24 || sig.some((v, i) => head[i] !== v))
+    throw new Error('not a PNG (only PNG is supported)')
+  if ((b64.length * 3) / 4 > MAX_BYTES) throw new Error('PNG is over 2 MiB')
+  const dv = new DataView(head.buffer, head.byteOffset)
+  return { png: b64, width: dv.getUint32(16), height: dv.getUint32(20), label }
+}
+
+async function load($: any, input: { path?: string; base64?: string }): Promise<Img> {
+  if (input.base64) return parsePng(input.base64, 'base64 image')
+  if (!input.path) throw new Error('give a path or base64 PNG data')
+  const { base64 } = await $.fs.read(input.path, { as: 'bytes' })
+  return { ...parsePng(base64, input.path), path: input.path }
+}
+
+async function show($: any, input: { path?: string; base64?: string }, isPane: boolean): Promise<string> {
+  const img = await load($, input)
+  await update($, image, () => img)
+  await update($, view, () => ({ zoom: 1, panX: 0, panY: 0 }))
+  if (isPane) await $.ui.open({ id: PANE, title: 'Image' })
+
+  return `Showing ${img.label} (${img.width}x${img.height})${isPane ? ' in the Image pane' : ''}.`
+}
+
+// Inline in the conversation: under the show_image tool row and the /img output row.
+// Drawn by the terminal's own image protocol where it has one (Ghostty, kitty, iTerm2 3.5+ fullscreen), else alt text.
+// Rows are redrawn often, so each picture is read once (shortcut: cache never evicts).
+const cache = new Map<string, Img | null>()
+
+async function inlineImg($: any, key: string, input: { path?: string; base64?: string }) {
+  if (!cache.has(key))
+    cache.set(key, await load($, input).catch(() => null))
+
+  return cache.get(key) ?? null
+}
+
+function under(e: any, $: any, row: any, imgs: Img[]) {
+  if (imgs.length === 0) return row
+  const { Box, Image } = $.ui.resolve(e)
+  const columns = Math.max(10, Math.min(80, (e.viewport?.columns ?? 80) - 6))
+
+  return (
+    <Box flexDirection="column">
+      {row}
+      {imgs.map((img, i) => (
+        <Image
+          key={`img${i}`}
+          source={{ png: img.png }}
+          columns={columns}
+          rows={Math.max(1, Math.min(24, Math.round((columns * img.height) / img.width / 2)))}
+          alt={`${img.label} (this terminal cannot draw images inline; see the pane's open button or /img --pane)`}
+        />
+      ))}
+    </Box>
+  )
+}
+
+// PNG image blocks of any tool's stored result (checked by shape, not by tool name, so any MCP server's graphs work): [{ type: 'image', source: { type: 'base64', media_type, data } }, ...]
+function pngBlocks(output: unknown): Img[] {
+  if (!Array.isArray(output)) return []
+  const found: Img[] = []
+  for (const b of output) {
+    const src = b?.type === 'image' ? b.source : null
+    if (src?.type !== 'base64' || src.media_type !== 'image/png') continue
+    try {
+      found.push(parsePng(src.data, 'tool image'))
+    } catch {} // shortcut: a PNG over 2 MiB or a bad one is skipped; JPEG is not drawn
+  }
+
+  return found.slice(0, 3)
+}
+
+export const register: Register = (on, options) => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'img',
+      description: 'Show a PNG inline (add --pane for a zoom/pan pane): /img [--pane] <path|base64>',
+      argumentHint: '[--pane] <path|base64>',
+    })
+    await $.tool.register({
+      name: 'show_image',
+      description:
+        'Show a PNG image to the user, inline under this tool call (or in a pane if the user turned that on). Works in terminals with inline images (Ghostty, kitty, iTerm2 3.5+ fullscreen); elsewhere the user sees only alt text and an open-in-viewer button. Give a file path (cheap) or base64 PNG data (costly: you would have to write it out).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'PNG file path' },
+          base64: { type: 'string', description: 'base64 PNG data' },
+        },
+      },
+      isDeferred: false,
+    })
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'img' }, async ($, e) => {
+    const raw = String(e.args ?? '')
+    const isPane = options.openPane === true || /(^|\s)--pane(\s|$)/.test(raw)
+    const arg = raw.replace(/(^|\s)--pane(\s|$)/g, ' ').trim().replace(/^["'`]+|["'`.,;]+$/g, '')
+    try {
+      // a PNG's base64 starts "iVBOR"; anything else is a path
+      return { text: await show($, arg.startsWith('iVBOR') || arg.startsWith('data:') ? { base64: arg } : { path: arg }, isPane) }
+    } catch (err) {
+      return { text: `/img: ${(err as Error).message}` }
+    }
+  })
+
+  on('tool.call', { tool: 'mcp__show-image__show_image' }, async ($, e) => {
+    try {
+      return { result: await show($, e as unknown as { path?: string; base64?: string }, options.openPane === true) }
+    } catch (err) {
+      return { deny: (err as Error).message }
+    }
+  })
+
+  // The body's size as last drawn, so a wheel tick can clamp the pan like a button does.
+  let body = { cols: 76, rows: 20 }
+
+  const layout = (img: Img, zoom: number, bodyCols: number, bodyRows: number) => {
+    // fit the whole picture in the body less the two rows of header and buttons;
+    // a cell is about twice as tall as wide
+    const viewRows = Math.max(3, bodyRows - 3)
+    let fitCols = Math.max(4, bodyCols)
+    let fitRows = Math.round((fitCols * img.height) / img.width / 2)
+    if (fitRows > viewRows) {
+      fitRows = viewRows
+      fitCols = Math.max(1, Math.round((fitRows * 2 * img.width) / img.height))
+    }
+    const clamp = (n: number) => Math.max(1, Math.min(255, Math.round(n)))
+    const columns = clamp(fitCols * zoom)
+    const rows = clamp(Math.max(1, fitRows) * zoom)
+    return { columns, rows, viewRows, maxX: Math.max(0, columns - bodyCols), maxY: Math.max(0, rows - viewRows) }
+  }
+
+  // The wheel or a two-finger vertical swipe pans the picture instead of the pane's rows.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const img = await read($, image)
+    if (!img) return {}
+    await update($, view, v => {
+      const { maxY } = layout(img, v.zoom, body.cols, body.rows)
+      return { ...v, panY: Math.max(0, Math.min(maxY, v.panY + e.by * 2)) }
+    })
+
+    return {}
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button, Image } = $.ui.resolve(e)
+    const img = await read($, image)
+    if (!img) return <Text dimColor>No image yet. Use /img --pane &lt;path&gt;.</Text>
+    const v = await read($, view)
+    const bodyCols = e.props.bodyColumns || (e.viewport?.columns ?? 80) - 4
+    const bodyRows = e.props.scroll?.bodyRows || (e.viewport?.rows ?? 24) - 5
+    body = { cols: bodyCols, rows: bodyRows }
+    const L = layout(img, v.zoom, bodyCols, bodyRows)
+    const x = Math.min(v.panX, L.maxX)
+    const y = Math.min(v.panY, L.maxY)
+    const zoomTo = (z: number) => update($, view, () => ({ zoom: Math.max(0.25, Math.min(8, z)), panX: 0, panY: 0 }))
+    const pan = (dx: number, dy: number) =>
+      update($, view, s => ({
+        ...s,
+        panX: Math.max(0, Math.min(L.maxX, s.panX + dx)),
+        panY: Math.max(0, Math.min(L.maxY, s.panY + dy)),
+      }))
+
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>{img.label} {img.width}x{img.height}, zoom {Math.round(v.zoom * 100)}%</Text>
+        <Box flexWrap="wrap">
+          <Button key="zin" label="+ i" hotkey="i" onPress={() => zoomTo(v.zoom * 1.5)} />
+          <Button key="zout" label="- o" hotkey="o" onPress={() => zoomTo(v.zoom / 1.5)} />
+          <Button key="fit" label="fit 0" hotkey="0" onPress={() => zoomTo(1)} />
+          <Button key="left" label="< h" hotkey="h" onPress={() => pan(-10, 0)} />
+          <Button key="down" label="v j" hotkey="j" onPress={() => pan(0, 3)} />
+          <Button key="up" label="^ k" hotkey="k" onPress={() => pan(0, -3)} />
+          <Button key="right" label="> l" hotkey="l" onPress={() => pan(10, 0)} />
+          {img.path && <Button key="open" label="open e" hotkey="e" onPress={() => openExternally($, img.path!)} />}
+        </Box>
+        <Box overflow="hidden" width={bodyCols} height={L.viewRows}>
+          <Box marginLeft={-x} marginTop={-y}>
+            <Image source={{ png: img.png }} columns={L.columns} rows={L.rows} alt={`${img.label}: this terminal cannot draw images inline (Ghostty, kitty and iTerm2 3.5+ in fullscreen can)${img.path ? '; press e to open it' : ''}`} />
+          </Box>
+        </Box>
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const row = await next(e)
+    if (e.props.tool !== 'mcp__show-image__show_image') return under(e, $, row, pngBlocks(e.props.output))
+    if (options.openPane === true) return row
+    const input = (e.props.input ?? {}) as { path?: string; base64?: string }
+    const key = input.path ?? (input.base64 ? input.base64.slice(-64) : '')
+    const img = key ? await inlineImg($, key, input) : null
+
+    return under(e, $, row, img ? [img] : [])
+  })
+
+  // A folded run of tool calls is one line: draw the calls' pictures under it.
+  // Expanded, each call is a ToolUse row that draws its own.
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    const row = await next(e)
+    if (e.props.isExpanded) return row
+
+    return under(e, $, row, e.props.calls.flatMap(c => pngBlocks(c.output)).slice(0, 3))
+  })
+
+  on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
+    const row = await next(e)
+    if (e.props.command !== 'img') return row
+    // args arrive empty for a plugin command; the row's own text names the source
+    const arg = /Showing (.+?) \(\d+x\d+\)/.exec(String(e.props.text ?? ''))?.[1] ?? ''
+    // the pane shows it: the row's text says so, and --pane means no inline copy
+    if (e.props.isErrored || !arg || String(e.props.text).includes('in the Image pane')) return row
+
+    const img = await inlineImg($, arg, arg.startsWith('iVBOR') ? { base64: arg } : { path: arg })
+
+    return under(e, $, row, img ? [img] : [])
+  })
+}

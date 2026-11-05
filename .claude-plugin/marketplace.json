@@ -1,0 +1,5 @@
+{
+  "name": "claude-show-image",
+  "owner": { "name": "Jeff Liu" },
+  "plugins": [{ "name": "show-image", "source": "./" }]
+}
