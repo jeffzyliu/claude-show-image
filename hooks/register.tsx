@@ -83,20 +83,27 @@ async function inlineImg($: any, key: string, input: { path?: string; base64?: s
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
   const { Box, Image } = $.ui.resolve(e)
-  const columns = Math.max(10, Math.min(80, (e.viewport?.columns ?? 80) - 6))
+  const total = Math.max(10, Math.min(80, (e.viewport?.columns ?? 80) - 6))
+  // side by side when each picture still gets 20+ columns; else stacked with a blank line between
+  const per = Math.floor((total - (imgs.length - 1)) / imgs.length)
+  const side = per >= 20
+  const columns = side ? per : total
 
   return (
     <Box flexDirection="column">
       {row}
-      {imgs.map((img, i) => (
-        <Image
-          key={`img${i}`}
-          source={{ png: img.png }}
-          columns={columns}
-          rows={Math.max(1, Math.min(24, Math.round((columns * img.height) / img.width / 2)))}
-          alt={`${img.label} (this terminal cannot draw images inline; see the pane's open button or /img --pane)`}
-        />
-      ))}
+      <Box flexDirection={side ? 'row' : 'column'}>
+        {imgs.map((img, i) => (
+          <Box key={`img${i}`} marginLeft={side && i > 0 ? 1 : 0} marginTop={!side && i > 0 ? 1 : 0}>
+            <Image
+              source={{ png: img.png }}
+              columns={columns}
+              rows={Math.max(1, Math.min(24, Math.round((columns * img.height) / img.width / 2)))}
+              alt={`${img.label} (this terminal cannot draw images inline; see the pane's open button or /img --pane)`}
+            />
+          </Box>
+        ))}
+      </Box>
     </Box>
   )
 }
