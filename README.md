@@ -34,7 +34,7 @@ The mod hands the engine an image element and the engine paints it with what you
 | tmux | Works only with `allow-passthrough` and `focus-events` on, inside a terminal above |
 | Anything else | Alt text instead of the picture; in the pane, press `e` (or click "open e") to open the file in your system viewer |
 
-The mod cannot detect your terminal; it always sends the picture and the engine decides what to draw.
+The mod cannot detect your terminal; it always sends the picture and the engine decides what to draw. The engine decides from the terminal that *started* the session, not the one you are attached from: a session started in iTerm (or by `claude agents` launched there) and viewed in Ghostty shows alt text. Start the session, or `claude agents`, from the terminal you are looking at, or use the pane's `e` button.
 
 ## Limits
 PNG only, under 2 MiB each, up to 3 per row. JPEG, GIF, WebP, URLs and file-path results are not drawn. Pinch zoom and sideways swipes are not available: terminals do not send them.

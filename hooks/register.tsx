@@ -26,7 +26,13 @@ const view = atom({ plugin: 'show-image', key: 'view' } as const, { zoom: 1, pan
   shape: 'view-2',
 })
 // Fallback for terminals that can't draw inline images (see the header): hand the file to the system viewer.
-async function openExternally($: any, path: string) {
+async function openExternally($: any, img: Img) {
+  let path = img.path
+  if (!path) {
+    // no file behind it (tool result, pasted base64): decode to a temp file first
+    path = `/tmp/show-image-${img.png.slice(-24).replace(/[^A-Za-z0-9]/g, '')}.png`
+    await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', path], { stdin: img.png })
+  }
   for (const cmd of ['open', 'xdg-open']) {
     try {
       const r = await $.process.run([cmd, path])
@@ -39,6 +45,13 @@ async function openExternally($: any, path: string) {
 const image = atom({ plugin: 'show-image', key: 'image' } as const, null, {
   shape: 'image-2',
 })
+
+// The inline button: the same as `/img --pane` for a picture that is already loaded.
+async function openPane($: any, img: Img) {
+  await update($, image, () => img)
+  await update($, view, () => ({ zoom: 1, panX: 0, panY: 0 }))
+  await $.ui.open({ id: PANE, title: 'Image' })
+}
 
 // Reads the PNG's size from its header. shortcut: PNG only (`Image` takes PNG or raw RGBA on every terminal); JPEG/GIF would need a decoder, convert first.
 function parsePng(base64: string, label: string): Img {
@@ -82,7 +95,7 @@ async function inlineImg($: any, key: string, input: { path?: string; base64?: s
 
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
-  const { Box, Image } = $.ui.resolve(e)
+  const { Box, Image, Button } = $.ui.resolve(e)
   const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6)
   // side by side only when each picture still gets 40+ columns (80 max each); else stacked with a blank line between
   const per = Math.min(80, Math.floor((avail - (imgs.length - 1)) / imgs.length))
@@ -94,13 +107,14 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
       {row}
       <Box flexDirection={side ? 'row' : 'column'}>
         {imgs.map((img, i) => (
-          <Box key={`img${i}`} marginLeft={side && i > 0 ? 1 : 0} marginTop={!side && i > 0 ? 1 : 0}>
+          <Box key={`img${i}`} flexDirection="column" marginLeft={side && i > 0 ? 1 : 0} marginTop={!side && i > 0 ? 1 : 0}>
             <Image
               source={{ png: img.png }}
               columns={columns}
               rows={Math.max(1, Math.min(24, Math.round((columns * img.height) / img.width / 2)))}
-              alt={`${img.label} (this terminal cannot draw images inline; see the pane's open button or /img --pane)`}
+              alt={`${img.label} (this terminal cannot draw images inline, or the session was started from a different terminal than this one; see the pane's open button or /img --pane)`}
             />
+            <Button key={`open${i}`} label="open in tab" onPress={() => openPane($, img)} />
           </Box>
         ))}
       </Box>
@@ -228,7 +242,7 @@ export const register: Register = (on, options) => {
           <Button key="down" label="v j" hotkey="j" onPress={() => pan(0, 3)} />
           <Button key="up" label="^ k" hotkey="k" onPress={() => pan(0, -3)} />
           <Button key="right" label="> l" hotkey="l" onPress={() => pan(10, 0)} />
-          {img.path && <Button key="open" label="open e" hotkey="e" onPress={() => openExternally($, img.path!)} />}
+          <Button key="open" label="open e" hotkey="e" onPress={() => openExternally($, img)} />
         </Box>
         <Box overflow="hidden" width={bodyCols} height={L.viewRows}>
           <Box marginLeft={-x} marginTop={-y}>
