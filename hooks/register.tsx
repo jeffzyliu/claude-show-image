@@ -13,7 +13,7 @@
 //   - Inline under any tool row whose result holds PNG image blocks (e.g. dofile graphs), folded or not.
 //   - Inline under the `/img` output row and the `show_image` tool row.
 //   - In a pane with zoom and pan (/img --pane, or the `openPane` option).
-// PNG only, under 2 MiB, up to 3 per row: that is what `Image` accepts.
+// PNG only, under 2 MiB, up to 5 per row: that is what `Image` accepts.
 
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
@@ -21,6 +21,7 @@ import type { Register } from 'claude-code'
 import type { Img, View } from '../types'
 
 const PANE = 'show-image'
+const MAX_IMGS = 5
 const MAX_BYTES = 2 * 1024 * 1024 // the most `Image` takes as bytes held by the plugin, on every terminal
 const view = atom({ plugin: 'show-image', key: 'view' } as const, { zoom: 1, panX: 0, panY: 0 } as View, {
   shape: 'view-2',
@@ -93,6 +94,10 @@ async function inlineImg($: any, key: string, input: { path?: string; base64?: s
   return cache.get(key) ?? null
 }
 
+type ToolInput = { path?: string; base64?: string; paths?: string[] }
+// The pictures a show_image call names: `paths` if given, else the single path/base64.
+const sources = (i: ToolInput) => (i.paths?.length ? i.paths.map(path => ({ path })) : [i])
+
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
   const { Box, Image, Button } = $.ui.resolve(e)
@@ -134,7 +139,7 @@ function pngBlocks(output: unknown): Img[] {
     } catch {} // shortcut: a PNG over 2 MiB or a bad one is skipped; JPEG is not drawn
   }
 
-  return found.slice(0, 3)
+  return found.slice(0, MAX_IMGS)
 }
 
 export const register: Register = (on, options) => {
@@ -147,12 +152,18 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'show_image',
       description:
-        'Show a PNG image to the user, inline under this tool call (or in a pane if the user turned that on). Works in terminals with inline images (Ghostty, kitty, iTerm2 3.5+ fullscreen); elsewhere the user sees only alt text and an open-in-viewer button. Give a file path (cheap) or base64 PNG data (costly: you would have to write it out).',
+        'Show a PNG image to the user, inline under this tool call (or in a pane if the user turned that on). Works in terminals with inline images (Ghostty, kitty, iTerm2 3.5+ fullscreen); elsewhere the user sees only alt text and an open-in-viewer button. Give a file path, or up to 5 in paths (cheap) or base64 PNG data (costly: you would have to write it out).',
       inputSchema: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'PNG file path' },
           base64: { type: 'string', description: 'base64 PNG data' },
+          paths: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: MAX_IMGS,
+            description: `Up to ${MAX_IMGS} PNG file paths to show together (instead of path)`,
+          },
         },
       },
       isDeferred: false,
@@ -175,7 +186,12 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__show-image__show_image' }, async ($, e) => {
     try {
-      return { result: await show($, e as unknown as { path?: string; base64?: string }, options.openPane === true) }
+      const input = e as unknown as ToolInput
+      const list = sources(input)
+      if (list.length > MAX_IMGS) throw new Error(`at most ${MAX_IMGS} images`)
+      for (const src of list.slice(1)) await load($, src) // validate the rest; the pane shows the first
+      const text = await show($, list[0] ?? {}, options.openPane === true)
+      return { result: list.length > 1 ? `${text} (+${list.length - 1} more shown inline)` : text }
     } catch (err) {
       return { deny: (err as Error).message }
     }
@@ -257,11 +273,14 @@ export const register: Register = (on, options) => {
     const row = await next(e)
     if (e.props.tool !== 'mcp__show-image__show_image') return under(e, $, row, pngBlocks(e.props.output))
     if (options.openPane === true) return row
-    const input = (e.props.input ?? {}) as { path?: string; base64?: string }
-    const key = input.path ?? (input.base64 ? input.base64.slice(-64) : '')
-    const img = key ? await inlineImg($, key, input) : null
+    const imgs: Img[] = []
+    for (const src of sources((e.props.input ?? {}) as ToolInput).slice(0, MAX_IMGS)) {
+      const key = src.path ?? (src.base64 ? src.base64.slice(-64) : '')
+      const img = key ? await inlineImg($, key, src) : null
+      if (img) imgs.push(img)
+    }
 
-    return under(e, $, row, img ? [img] : [])
+    return under(e, $, row, imgs)
   })
 
   // A folded run of tool calls is one line: draw the calls' pictures under it.
@@ -270,7 +289,7 @@ export const register: Register = (on, options) => {
     const row = await next(e)
     if (e.props.isExpanded) return row
 
-    return under(e, $, row, e.props.calls.flatMap(c => pngBlocks(c.output)).slice(0, 3))
+    return under(e, $, row, e.props.calls.flatMap(c => pngBlocks(c.output)).slice(0, MAX_IMGS))
   })
 
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {

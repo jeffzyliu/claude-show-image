@@ -21,7 +21,7 @@ Claude Code asks to add the marketplace (answer `y`), then which scope to instal
 - **Automatically:** any tool result that contains PNG image blocks (a dofile graph, any other MCP server's chart) is drawn under that tool's row, folded or expanded.
 - **`/img <path|base64>`:** draws a PNG file (or pasted base64) under the command's output line.
 - **`/img --pane <path>`:** opens a pane instead, with zoom and pan. Keys while the pane has focus: `i` zoom in, `o` zoom out, `0` fit, `h` `j` `k` `l` pan, `e` open in the system viewer. The mouse wheel or a two-finger vertical swipe pans up and down.
-- **`show_image` tool:** lets the model show you a PNG by path.
+- **`show_image` tool:** lets the model show you a PNG by path, or up to 5 at once with `paths`.
 - **Option `openPane`** (off by default): open the pane for every image.
 
 ## Terminal support
@@ -37,4 +37,4 @@ The mod hands the engine an image element and the engine paints it with what you
 The mod cannot detect your terminal; it always sends the picture and the engine decides what to draw. The engine decides from the terminal that *started* the session, not the one you are attached from: a session started in iTerm (or by `claude agents` launched there) and viewed in Ghostty shows alt text. Start the session, or `claude agents`, from the terminal you are looking at, or use the pane's `e` button.
 
 ## Limits
-PNG only, under 2 MiB each, up to 3 per row. JPEG, GIF, WebP, URLs and file-path results are not drawn. Pinch zoom and sideways swipes are not available: terminals do not send them.
+PNG only, under 2 MiB each, up to 5 per row. JPEG, GIF, WebP, URLs and file-path results are not drawn. Pinch zoom and sideways swipes are not available: terminals do not send them.
