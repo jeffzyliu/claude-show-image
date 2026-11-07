@@ -69,8 +69,40 @@ function parsePng(base64: string, label: string): Img {
 async function load($: any, input: { path?: string; base64?: string }): Promise<Img> {
   if (input.base64) return parsePng(input.base64, 'base64 image')
   if (!input.path) throw new Error('give a path or base64 PNG data')
-  const { base64 } = await $.fs.read(input.path, { as: 'bytes' })
+  const src = /\.svg$/i.test(input.path) ? await svgToPng($, input.path) : input.path
+  const { base64 } = await $.fs.read(src, { as: 'bytes' })
   return { ...parsePng(base64, input.path), path: input.path }
+}
+
+// shortcut: SVG is rasterized by an installed converter (rsvg-convert, then ImageMagick); none installed -> error.
+// 1600 px wide is plenty for the inline and pane views and stays well under 2 MiB for typical charts.
+async function svgToPng($: any, path: string): Promise<string> {
+  const tag = path.replace(/[^A-Za-z0-9]/g, '').slice(-40)
+  const out = `/tmp/show-image-${tag}.png`
+  // rsvg and ImageMagick ignore CSS custom properties (fill: var(--surface)) and paint black: inline the :root values first
+  const { base64 } = await $.fs.read(path, { as: 'bytes' })
+  const text = new TextDecoder().decode(Uint8Array.fromBase64(base64))
+  if (text.includes('var(--')) {
+    const vars: Record<string, string> = {}
+    // shortcut: the first :root block only (the light theme); no @media or per-element overrides
+    for (const m of (/:root\s*\{([^}]*)\}/.exec(text)?.[1] ?? '').matchAll(/--([\w-]+)\s*:\s*([^;]+)/g)) vars[m[1]] = m[2].trim()
+    const flat = text.replace(/var\(--([\w-]+)(?:\s*,\s*([^)]*))?\)/g, (all, n, fallback) => vars[n] ?? fallback ?? all)
+    const flatPath = `/tmp/show-image-${tag}.svg`
+    await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', flatPath], { stdin: new TextEncoder().encode(flat).toBase64() })
+    path = flatPath
+  }
+  const attempts = [
+    ['rsvg-convert', '-w', '1600', path, '-o', out],
+    ['magick', '-background', 'none', '-density', '192', path, '-resize', '1600x>', out],
+    ['convert', '-background', 'none', '-density', '192', path, '-resize', '1600x>', out],
+  ]
+  for (const cmd of attempts) {
+    try {
+      const r = await $.process.run(cmd)
+      if (r.exitCode === 0) return out
+    } catch {} // converter not installed: try the next
+  }
+  throw new Error('cannot read SVG: install rsvg-convert (brew install librsvg) or ImageMagick')
 }
 
 async function show($: any, input: { path?: string; base64?: string }, isPane: boolean): Promise<string> {
@@ -105,7 +137,17 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
   // side by side only when each picture still gets 40+ columns (80 max each); else stacked with a blank line between
   const per = Math.min(80, Math.floor((avail - (imgs.length - 1)) / imgs.length))
   const side = imgs.length > 1 && per >= 40
-  const columns = side ? per : Math.min(80, avail)
+  const maxCols = side ? per : Math.min(80, avail)
+  // fit each picture in maxCols x 24 rows, keeping its aspect (a cell is about twice as tall as wide)
+  const fit = (img: Img) => {
+    let columns = Math.max(1, Math.min(maxCols, img.width)) // never upscale past the pixel width
+    let rows = Math.max(1, Math.round((columns * img.height) / img.width / 2))
+    if (rows > 24) {
+      rows = 24
+      columns = Math.max(1, Math.min(columns, Math.round((rows * 2 * img.width) / img.height)))
+    }
+    return { columns, rows }
+  }
 
   return (
     <Box flexDirection="column">
@@ -115,8 +157,8 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
           <Box key={`img${i}`} flexDirection="column" marginLeft={side && i > 0 ? 1 : 0} marginTop={!side && i > 0 ? 1 : 0}>
             <Image
               source={{ png: img.png }}
-              columns={columns}
-              rows={Math.max(1, Math.min(24, Math.round((columns * img.height) / img.width / 2)))}
+              columns={fit(img).columns}
+              rows={fit(img).rows}
               alt={`${img.label} (this terminal cannot draw images inline, or the session was started from a different terminal than this one; see the pane's open button or /img --pane)`}
             />
             <Button key={`open${i}`} label="open in tab" onPress={() => openPane($, img)} />

@@ -37,4 +37,4 @@ The mod hands the engine an image element and the engine paints it with what you
 The mod cannot detect your terminal; it always sends the picture and the engine decides what to draw. The engine decides from the terminal that *started* the session, not the one you are attached from: a session started in iTerm (or by `claude agents` launched there) and viewed in Ghostty shows alt text. Start the session, or `claude agents`, from the terminal you are looking at, or use the pane's `e` button.
 
 ## Limits
-PNG only, under 2 MiB each, up to 5 per row. JPEG, GIF, WebP, URLs and file-path results are not drawn. Pinch zoom and sideways swipes are not available: terminals do not send them.
+PNG only (an `.svg` path is converted first with rsvg-convert or ImageMagick, if installed), under 2 MiB each, up to 5 per row. JPEG, GIF, WebP, URLs and file-path results are not drawn. Pinch zoom and sideways swipes are not available: terminals do not send them.
