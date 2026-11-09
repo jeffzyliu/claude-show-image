@@ -1,6 +1,6 @@
 {
   "name": "show-image",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Show PNGs inline in the conversation (dofile graphs and other tools' images, /img, show_image) with an optional zoom/pan pane. Inline images need Ghostty, kitty, or iTerm2 3.5+ in fullscreen; other terminals get alt text and an open-in-viewer button.",
   "types": "./types/index.d.ts",
   "userConfig": {

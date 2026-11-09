@@ -38,6 +38,7 @@ const b64Bytes =(b64: string) => Math.ceil((b64.length * 3) / 4)
 const bytesOf = (img: Img) => b64Bytes(img.png)
 const previewBytes = (img: Img) => b64Bytes(img.thumb ?? img.png) // what the inline row holds
 const THUMB_MIN = 150 * 1024 // smaller pictures are shown as they are
+const MAX_PX = 4096 // the most `Image` takes on a side; over it the engine skips the whole tree
 const THUMB_PX = 1200 // longest side of an inline thumbnail
 const view = atom({ plugin: 'show-image', key: 'view' } as const, { zoom: 1, panX: 0, panY: 0 } as View, {
   shape: 'view-2',
@@ -124,11 +125,11 @@ async function svgToPng($: any, path: string): Promise<string> {
 // `open` and the pane still use the full picture. shortcut: sips (macOS), then ImageMagick; none -> the full picture is used.
 const thumbs = new Map<string, string | null>()
 
-async function makeThumb($: any, img: Img, tag: string): Promise<string | null> {
+async function makeThumb($: any, img: Img, tag: string, maxPx: number): Promise<string | null> {
   const src = `/tmp/show-image-full-${tag}.png`
   const out = `/tmp/show-image-thumb-${tag}.png`
   await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', src], { stdin: img.png })
-  const px = String(THUMB_PX)
+  const px = String(maxPx)
   const attempts = [
     ['sips', '-Z', px, src, '--out', out],
     ['magick', src, '-resize', `${px}x${px}>`, out],
@@ -139,23 +140,29 @@ async function makeThumb($: any, img: Img, tag: string): Promise<string | null> 
       const r = await $.process.run(cmd)
       if (r.exitCode !== 0) continue
       const { base64 } = await $.fs.read(out, { as: 'bytes' })
-      return b64Bytes(base64) < bytesOf(img) ? base64 : null
+      return base64
     } catch {} // converter not installed: try the next
   }
   return null
 }
 
-async function withThumbs($: any, imgs: Img[]): Promise<Img[]> {
+// `force`: make the copy even for a small file (the pane's, for a side over MAX_PX).
+async function withThumbs($: any, imgs: Img[], maxPx = THUMB_PX, force = false): Promise<Img[]> {
   return Promise.all(
     imgs.map(async img => {
-      if (bytesOf(img) < THUMB_MIN) return img
-      const key = `${img.png.length}:${img.png.slice(-48)}`
-      if (!thumbs.has(key)) thumbs.set(key, await makeThumb($, img, key.replace(/[^A-Za-z0-9]/g, '').slice(-40)).catch(() => null))
+      if (!force && bytesOf(img) < THUMB_MIN && Math.max(img.width, img.height) <= MAX_PX) return img
+      const key = `${maxPx}:${img.png.length}:${img.png.slice(-48)}`
+      if (!thumbs.has(key)) thumbs.set(key, await makeThumb($, img, key.replace(/[^A-Za-z0-9]/g, '').slice(-40), maxPx).catch(() => null))
       const thumb = thumbs.get(key)
-      return thumb ? { ...img, thumb } : img
+      // a "thumbnail" that is no smaller in bytes is not worth keeping, unless the original's side is over the limit
+      return thumb && (b64Bytes(thumb) < bytesOf(img) || Math.max(img.width, img.height) > MAX_PX) ? { ...img, thumb } : img
     }),
   )
 }
+
+// Whether `Image` will take what we would hand it: the engine refuses a side over MAX_PX (it skips the whole tree)
+// and more than MAX_BYTES of image data.
+const previewable = (img: Img) => (img.thumb !== undefined || Math.max(img.width, img.height) <= MAX_PX) && previewBytes(img) <= MAX_BYTES
 
 async function show($: any, input: { path?: string; base64?: string }, isPane: boolean): Promise<string> {
   const img = await load($, input)
@@ -207,7 +214,7 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
   let budget = MAX_BYTES
   const drawable = new Set<Img>()
   for (const img of imgs)
-    if (previewBytes(img) <= budget) {
+    if (previewable(img) && previewBytes(img) <= budget) {
       budget -= previewBytes(img)
       drawable.add(img)
     }
@@ -362,8 +369,10 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Image } = $.ui.resolve(e)
-    const img = await read($, image)
-    if (!img) return <Text dimColor>No image yet. Use /img --pane &lt;path&gt;.</Text>
+    const full = await read($, image)
+    if (!full) return <Text dimColor>No image yet. Use /img --pane &lt;path&gt;.</Text>
+    // a side over MAX_PX is refused by `Image`: draw a downscaled copy (open e still opens the full file)
+    const img = Math.max(full.width, full.height) > MAX_PX ? (await withThumbs($, [full], MAX_PX, true))[0] : full
     const v = await read($, view)
     const bodyCols = e.props.bodyColumns || (e.viewport?.columns ?? 80) - 4
     const bodyRows = e.props.scroll?.bodyRows || (e.viewport?.rows ?? 24) - 5
@@ -394,10 +403,10 @@ export const register: Register = (on, options) => {
         </Box>
         <Box overflow="hidden" width={bodyCols} height={L.viewRows}>
           <Box marginLeft={-x} marginTop={-y}>
-            {bytesOf(img) <= MAX_BYTES ? (
-              <Image source={{ png: img.png }} columns={L.columns} rows={L.rows} alt={`${img.label}: this terminal cannot draw images inline (Ghostty, kitty and iTerm2 3.5+ in fullscreen can)${img.path ? '; press e to open it' : ''}`} />
+            {previewable(img) ? (
+              <Image source={{ png: img.thumb ?? img.png }} columns={L.columns} rows={L.rows} alt={`${img.label}: this terminal cannot draw images inline (Ghostty, kitty and iTerm2 3.5+ in fullscreen can)${img.path ? '; press e to open it' : ''}`} />
             ) : (
-              <Text dimColor>Too large to preview (over 2 MiB). Press e to open it in the system viewer.</Text>
+              <Text dimColor>Too large to preview (over 2 MiB or 4096 px a side). Press e to open it in the system viewer.</Text>
             )}
           </Box>
         </Box>
