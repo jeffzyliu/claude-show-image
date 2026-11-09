@@ -184,9 +184,17 @@ const sources = (i: ToolInput) => (i.paths?.length ? i.paths.map(path => ({ path
 // The file name to show for a picture: its label (the path or a source name) without the folders.
 const baseName = (img: Img) => img.label.split('/').pop() || img.label
 
+// The file name as a link that opens the file (the terminal's own click or cmd-click on a link), when the picture has an absolute path.
+function nameLink(Link: any, img: Img) {
+  const name = baseName(img)
+  if (!img.path?.startsWith('/')) return name
+
+  return <Link href={`file://${encodeURI(img.path)}`} label={name} />
+}
+
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
-  const { Box, Image, Button, Text } = $.ui.resolve(e)
+  const { Box, Image, Button, Text, Link } = $.ui.resolve(e)
   const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6)
   // Pictures go in rows of as many as fit with MIN_COLS columns each (MAX_COLS at most); more than that wrap to the next row.
   const perRow = Math.max(1, Math.floor((avail + 1) / (MIN_COLS + 1)))
@@ -222,7 +230,7 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
               const { columns, rows } = fit(img, maxCols)
               return (
                 <Box key={`img${i}`} flexDirection="column" marginLeft={j > 0 ? 1 : 0}>
-                  <Text bold>{baseName(img)}</Text>
+                  <Text bold>{nameLink(Link, img)}</Text>
                   <Box>
                     <Button key={`tab${i}`} dimColor label="open in tab" onPress={() => openPane($, img)} />
                     <Button key={`open${i}`} dimColor label="open" onPress={() => openExternally($, img)} />
@@ -407,7 +415,7 @@ export const register: Register = (on, options) => {
     if (imgs.length === 0) return row // an error or an unreadable file: keep Claude Code's own row, it says why
 
     // Replace Claude Code's row (the full paths and the "Showing ..." result line) with just the file names.
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Link } = $.ui.resolve(e)
     // the bullet as Claude Code draws it: dim while running, red on error, green when done
     const bullet = e.props.isRunning ? <Text dimColor>⏺</Text> : <Text color={e.props.isErrored ? 'red' : 'green'}>⏺</Text>
     const header = (
@@ -415,7 +423,16 @@ export const register: Register = (on, options) => {
         {bullet}
         <Text> </Text>
         <Text bold>show_image</Text>
-        <Text> ({imgs.map(baseName).join(', ')})</Text>
+        <Text>
+          {' ('}
+          {imgs.map((img, i) => (
+            <Text key={`n${i}`}>
+              {i > 0 ? ', ' : ''}
+              {nameLink(Link, img)}
+            </Text>
+          ))}
+          {')'}
+        </Text>
       </Box>
     )
 
