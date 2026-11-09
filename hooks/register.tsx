@@ -33,6 +33,7 @@ const CELL_ASPECT = 2.25
 const MIN_COLS = 60 // each inline picture gets at least this many columns (it wraps to a new row instead of shrinking)
 const MAX_COLS = 90
 const MAX_ROWS = 36
+const INDENT = 2 // columns the pictures (with their names and buttons) are indented under the tool row
 const b64Bytes =(b64: string) => Math.ceil((b64.length * 3) / 4)
 const bytesOf = (img: Img) => b64Bytes(img.png)
 const previewBytes = (img: Img) => b64Bytes(img.thumb ?? img.png) // what the inline row holds
@@ -195,7 +196,7 @@ function nameLink(Link: any, img: Img) {
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
   const { Box, Image, Button, Text, Link } = $.ui.resolve(e)
-  const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6)
+  const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6 - INDENT)
   // Pictures go in rows of as many as fit with MIN_COLS columns each (MAX_COLS at most); more than that wrap to the next row.
   const perRow = Math.max(1, Math.floor((avail + 1) / (MIN_COLS + 1)))
   const rowsOfImgs: Img[][] = []
@@ -221,6 +222,7 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
   return (
     <Box flexDirection="column">
       {row}
+      <Box flexDirection="column" marginLeft={INDENT}>
       {rowsOfImgs.map((group, r) => {
         const maxCols = Math.min(MAX_COLS, Math.floor((avail - (group.length - 1)) / group.length))
         return (
@@ -233,7 +235,6 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
                   <Text bold>{nameLink(Link, img)}</Text>
                   <Box>
                     <Button key={`tab${i}`} dimColor label="open in tab" onPress={() => openPane($, img)} />
-                    <Button key={`open${i}`} dimColor label="open" onPress={() => openExternally($, img)} />
                   </Box>
                   {drawable.has(img) ? (
                     <Image
@@ -251,6 +252,7 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
           </Box>
         )
       })}
+      </Box>
     </Box>
   )
 }
@@ -419,7 +421,7 @@ export const register: Register = (on, options) => {
     // the bullet as Claude Code draws it: dim while running, red on error, green when done
     const bullet = e.props.isRunning ? <Text dimColor>⏺</Text> : <Text color={e.props.isErrored ? 'red' : 'green'}>⏺</Text>
     const header = (
-      <Box marginBottom={1}>
+      <Box marginTop={1} marginBottom={1}>
         {bullet}
         <Text> </Text>
         <Text bold>show_image</Text>
