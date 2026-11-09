@@ -13,7 +13,8 @@
 //   - Inline under any tool row whose result holds PNG image blocks (e.g. dofile graphs), folded or not.
 //   - Inline under the `/img` output row and the `show_image` tool row.
 //   - In a pane with zoom and pan (/img --pane, or the `openPane` option).
-// PNG only, under 2 MiB, up to 5 per row: that is what `Image` accepts.
+// PNG only, up to 5 per row, and 2 MiB of image data in total per rendered tree (see MAX_BYTES); pictures past
+// that budget are left out of the preview but keep their buttons.
 
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
@@ -22,7 +23,21 @@ import type { Img, View } from '../types'
 
 const PANE = 'show-image'
 const MAX_IMGS = 5
-const MAX_BYTES = 2 * 1024 * 1024 // the most `Image` takes as bytes held by the plugin, on every terminal
+// The engine refuses a render tree whose Image elements hold more than this many bytes in total (not per image):
+// "more than 2097152 bytes of Image source in one tree". The refusal comes after we return, so we cannot catch it;
+// instead each tree gets this budget, and a picture that does not fit is left out (its buttons stay).
+const MAX_BYTES = 2 * 1024 * 1024
+// A terminal cell is this many times taller than wide. Too small a value reserves more rows than the picture
+// draws, and the engine centers it in them (a blank gap under the buttons); tune it if the gap returns.
+const CELL_ASPECT = 2.25
+const MIN_COLS = 60 // each inline picture gets at least this many columns (it wraps to a new row instead of shrinking)
+const MAX_COLS = 90
+const MAX_ROWS = 36
+const b64Bytes =(b64: string) => Math.ceil((b64.length * 3) / 4)
+const bytesOf = (img: Img) => b64Bytes(img.png)
+const previewBytes = (img: Img) => b64Bytes(img.thumb ?? img.png) // what the inline row holds
+const THUMB_MIN = 150 * 1024 // smaller pictures are shown as they are
+const THUMB_PX = 1200 // longest side of an inline thumbnail
 const view = atom({ plugin: 'show-image', key: 'view' } as const, { zoom: 1, panX: 0, panY: 0 } as View, {
   shape: 'view-2',
 })
@@ -61,7 +76,6 @@ function parsePng(base64: string, label: string): Img {
   const sig = [0x89, 0x50, 0x4e, 0x47]
   if (head.length < 24 || sig.some((v, i) => head[i] !== v))
     throw new Error('not a PNG (only PNG is supported)')
-  if ((b64.length * 3) / 4 > MAX_BYTES) throw new Error('PNG is over 2 MiB')
   const dv = new DataView(head.buffer, head.byteOffset)
   return { png: b64, width: dv.getUint32(16), height: dv.getUint32(20), label }
 }
@@ -105,6 +119,43 @@ async function svgToPng($: any, path: string): Promise<string> {
   throw new Error('cannot read SVG: install rsvg-convert (brew install librsvg) or ImageMagick')
 }
 
+// Inline rows draw a downscaled copy, so several big pictures fit the engine's 2 MiB-per-row budget;
+// `open` and the pane still use the full picture. shortcut: sips (macOS), then ImageMagick; none -> the full picture is used.
+const thumbs = new Map<string, string | null>()
+
+async function makeThumb($: any, img: Img, tag: string): Promise<string | null> {
+  const src = `/tmp/show-image-full-${tag}.png`
+  const out = `/tmp/show-image-thumb-${tag}.png`
+  await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', src], { stdin: img.png })
+  const px = String(THUMB_PX)
+  const attempts = [
+    ['sips', '-Z', px, src, '--out', out],
+    ['magick', src, '-resize', `${px}x${px}>`, out],
+    ['convert', src, '-resize', `${px}x${px}>`, out],
+  ]
+  for (const cmd of attempts) {
+    try {
+      const r = await $.process.run(cmd)
+      if (r.exitCode !== 0) continue
+      const { base64 } = await $.fs.read(out, { as: 'bytes' })
+      return b64Bytes(base64) < bytesOf(img) ? base64 : null
+    } catch {} // converter not installed: try the next
+  }
+  return null
+}
+
+async function withThumbs($: any, imgs: Img[]): Promise<Img[]> {
+  return Promise.all(
+    imgs.map(async img => {
+      if (bytesOf(img) < THUMB_MIN) return img
+      const key = `${img.png.length}:${img.png.slice(-48)}`
+      if (!thumbs.has(key)) thumbs.set(key, await makeThumb($, img, key.replace(/[^A-Za-z0-9]/g, '').slice(-40)).catch(() => null))
+      const thumb = thumbs.get(key)
+      return thumb ? { ...img, thumb } : img
+    }),
+  )
+}
+
 async function show($: any, input: { path?: string; base64?: string }, isPane: boolean): Promise<string> {
   const img = await load($, input)
   await update($, image, () => img)
@@ -130,21 +181,31 @@ type ToolInput = { path?: string; base64?: string; paths?: string[] }
 // The pictures a show_image call names: `paths` if given, else the single path/base64.
 const sources = (i: ToolInput) => (i.paths?.length ? i.paths.map(path => ({ path })) : [i])
 
+// The file name to show for a picture: its label (the path or a source name) without the folders.
+const baseName = (img: Img) => img.label.split('/').pop() || img.label
+
 function under(e: any, $: any, row: any, imgs: Img[]) {
   if (imgs.length === 0) return row
-  const { Box, Image, Button } = $.ui.resolve(e)
+  const { Box, Image, Button, Text } = $.ui.resolve(e)
   const avail = Math.max(10, (e.viewport?.columns ?? 80) - 6)
-  // side by side only when each picture still gets 40+ columns (80 max each); else stacked with a blank line between
-  const per = Math.min(80, Math.floor((avail - (imgs.length - 1)) / imgs.length))
-  const side = imgs.length > 1 && per >= 40
-  const maxCols = side ? per : Math.min(80, avail)
-  // fit each picture in maxCols x 24 rows, keeping its aspect (a cell is about twice as tall as wide)
-  const fit = (img: Img) => {
+  // Pictures go in rows of as many as fit with MIN_COLS columns each (MAX_COLS at most); more than that wrap to the next row.
+  const perRow = Math.max(1, Math.floor((avail + 1) / (MIN_COLS + 1)))
+  const rowsOfImgs: Img[][] = []
+  for (let i = 0; i < imgs.length; i += perRow) rowsOfImgs.push(imgs.slice(i, i + perRow))
+  // fit each picture in maxCols x MAX_ROWS rows, keeping its aspect ratio
+  let budget = MAX_BYTES
+  const drawable = new Set<Img>()
+  for (const img of imgs)
+    if (previewBytes(img) <= budget) {
+      budget -= previewBytes(img)
+      drawable.add(img)
+    }
+  const fit = (img: Img, maxCols: number) => {
     let columns = Math.max(1, Math.min(maxCols, img.width)) // never upscale past the pixel width
-    let rows = Math.max(1, Math.round((columns * img.height) / img.width / 2))
-    if (rows > 24) {
-      rows = 24
-      columns = Math.max(1, Math.min(columns, Math.round((rows * 2 * img.width) / img.height)))
+    let rows = Math.max(1, Math.round((columns * img.height) / img.width / CELL_ASPECT))
+    if (rows > MAX_ROWS) {
+      rows = MAX_ROWS
+      columns = Math.max(1, Math.min(columns, Math.round((rows * CELL_ASPECT * img.width) / img.height)))
     }
     return { columns, rows }
   }
@@ -152,19 +213,36 @@ function under(e: any, $: any, row: any, imgs: Img[]) {
   return (
     <Box flexDirection="column">
       {row}
-      <Box flexDirection={side ? 'row' : 'column'}>
-        {imgs.map((img, i) => (
-          <Box key={`img${i}`} flexDirection="column" marginLeft={side && i > 0 ? 1 : 0} marginTop={!side && i > 0 ? 1 : 0}>
-            <Image
-              source={{ png: img.png }}
-              columns={fit(img).columns}
-              rows={fit(img).rows}
-              alt={`${img.label} (this terminal cannot draw images inline, or the session was started from a different terminal than this one; see the pane's open button or /img --pane)`}
-            />
-            <Button key={`open${i}`} label="open in tab" onPress={() => openPane($, img)} />
+      {rowsOfImgs.map((group, r) => {
+        const maxCols = Math.min(MAX_COLS, Math.floor((avail - (group.length - 1)) / group.length))
+        return (
+          <Box key={`row${r}`} flexDirection="row" marginTop={r > 0 ? 1 : 0}>
+            {group.map((img, j) => {
+              const i = r * perRow + j
+              const { columns, rows } = fit(img, maxCols)
+              return (
+                <Box key={`img${i}`} flexDirection="column" marginLeft={j > 0 ? 1 : 0}>
+                  <Text bold>{baseName(img)}</Text>
+                  <Box>
+                    <Button key={`tab${i}`} dimColor label="open in tab" onPress={() => openPane($, img)} />
+                    <Button key={`open${i}`} dimColor label="open" onPress={() => openExternally($, img)} />
+                  </Box>
+                  {drawable.has(img) ? (
+                    <Image
+                      source={{ png: img.thumb ?? img.png }}
+                      columns={columns}
+                      rows={rows}
+                      alt={`${img.label} (this terminal cannot draw images inline, or the session was started from a different terminal than this one; see the pane's open button or /img --pane)`}
+                    />
+                  ) : (
+                    <Text dimColor>{img.label} ({img.width}x{img.height}) is too large to preview inline</Text>
+                  )}
+                </Box>
+              )
+            })}
           </Box>
-        ))}
-      </Box>
+        )
+      })}
     </Box>
   )
 }
@@ -178,7 +256,7 @@ function pngBlocks(output: unknown): Img[] {
     if (src?.type !== 'base64' || src.media_type !== 'image/png') continue
     try {
       found.push(parsePng(src.data, 'tool image'))
-    } catch {} // shortcut: a PNG over 2 MiB or a bad one is skipped; JPEG is not drawn
+    } catch {} // shortcut: a bad PNG is skipped; JPEG is not drawn (an oversized one is kept: `under` leaves out its preview)
   }
 
   return found.slice(0, MAX_IMGS)
@@ -304,7 +382,11 @@ export const register: Register = (on, options) => {
         </Box>
         <Box overflow="hidden" width={bodyCols} height={L.viewRows}>
           <Box marginLeft={-x} marginTop={-y}>
-            <Image source={{ png: img.png }} columns={L.columns} rows={L.rows} alt={`${img.label}: this terminal cannot draw images inline (Ghostty, kitty and iTerm2 3.5+ in fullscreen can)${img.path ? '; press e to open it' : ''}`} />
+            {bytesOf(img) <= MAX_BYTES ? (
+              <Image source={{ png: img.png }} columns={L.columns} rows={L.rows} alt={`${img.label}: this terminal cannot draw images inline (Ghostty, kitty and iTerm2 3.5+ in fullscreen can)${img.path ? '; press e to open it' : ''}`} />
+            ) : (
+              <Text dimColor>Too large to preview (over 2 MiB). Press e to open it in the system viewer.</Text>
+            )}
           </Box>
         </Box>
       </Box>
@@ -313,7 +395,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     const row = await next(e)
-    if (e.props.tool !== 'mcp__show-image__show_image') return under(e, $, row, pngBlocks(e.props.output))
+    if (e.props.tool !== 'mcp__show-image__show_image') return under(e, $, row, await withThumbs($, pngBlocks(e.props.output)))
     if (options.openPane === true) return row
     const imgs: Img[] = []
     for (const src of sources((e.props.input ?? {}) as ToolInput).slice(0, MAX_IMGS)) {
@@ -322,7 +404,31 @@ export const register: Register = (on, options) => {
       if (img) imgs.push(img)
     }
 
-    return under(e, $, row, imgs)
+    if (imgs.length === 0) return row // an error or an unreadable file: keep Claude Code's own row, it says why
+
+    // Replace Claude Code's row (the full paths and the "Showing ..." result line) with just the file names.
+    const { Box, Text } = $.ui.resolve(e)
+    // the bullet as Claude Code draws it: dim while running, red on error, green when done
+    const bullet = e.props.isRunning ? <Text dimColor>⏺</Text> : <Text color={e.props.isErrored ? 'red' : 'green'}>⏺</Text>
+    const header = (
+      <Box marginBottom={1}>
+        {bullet}
+        <Text> </Text>
+        <Text bold>show_image</Text>
+        <Text> ({imgs.map(baseName).join(', ')})</Text>
+      </Box>
+    )
+
+    return under(e, $, header, await withThumbs($, imgs))
+  })
+
+  // The "Showing ..." line under the row is its own ToolResult: draw nothing for a call that worked
+  // (our header already names the files). An error keeps its text.
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    if (e.props.tool !== 'mcp__show-image__show_image' || e.props.isErrored || options.openPane === true) return next(e)
+    const { Box } = $.ui.resolve(e)
+
+    return <Box />
   })
 
   // A folded run of tool calls is one line: draw the calls' pictures under it.
@@ -331,7 +437,7 @@ export const register: Register = (on, options) => {
     const row = await next(e)
     if (e.props.isExpanded) return row
 
-    return under(e, $, row, e.props.calls.flatMap(c => pngBlocks(c.output)).slice(0, MAX_IMGS))
+    return under(e, $, row, await withThumbs($, e.props.calls.flatMap(c => pngBlocks(c.output)).slice(0, MAX_IMGS)))
   })
 
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
@@ -344,6 +450,6 @@ export const register: Register = (on, options) => {
 
     const img = await inlineImg($, arg, arg.startsWith('iVBOR') ? { base64: arg } : { path: arg })
 
-    return under(e, $, row, img ? [img] : [])
+    return under(e, $, row, img ? await withThumbs($, [img]) : [])
   })
 }
